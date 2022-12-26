@@ -1,0 +1,6 @@
+#!/bin/sh
+
+# Only call ceph-auto-snapshot if it's available
+which ceph-auto-snapshot > /dev/null || exit 0
+
+exec ceph-auto-snapshot --quiet --syslog --label=hourly --keep=12 home projects

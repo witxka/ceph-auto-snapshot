@@ -1,0 +1,28 @@
+---
+- hosts: ceph_server
+  any_errors_fatal: true
+  become: yes
+  tasks:
+  - name: Install /usr/local/bin/ceph-auto-snapshot
+    action: copy src="usr/local/bin/ceph-auto-snapshot"
+      dest="/usr/local/bin/ceph-auto-snapshot"
+      owner=0 group=0 mode=0755
+  - name: Configure ceph-autosnaphots crons
+    block:
+    - name: Install /etc/cron.hourly/ceph-auto-snapshot
+      action: copy src="etc/cron.hourly/ceph-auto-snapshot"
+        dest="/etc/cron.hourly/ceph-auto-snapshot"
+        owner=0 group=0 mode=0755
+    - name: Install /etc/cron.daily/ceph-auto-snapshot
+      action: copy src="etc/cron.daily/ceph-auto-snapshot"
+        dest="/etc/cron.daily/ceph-auto-snapshot"
+        owner=0 group=0 mode=0755
+    - name: Install /etc/cron.weekly/ceph-auto-snapshot
+      action: copy src="etc/cron.weekly/ceph-auto-snapshot"
+        dest="/etc/cron.weekly/ceph-auto-snapshot"
+        owner=0 group=0 mode=0755
+    - name: Install /etc/cron.monthly/ceph-auto-snapshot
+      action: copy src="etc/cron.monthly/ceph-auto-snapshot"
+        dest="/etc/cron.weekly/ceph-auto-snapshot"
+        owner=0 group=0 mode=0755
+...

@@ -1,0 +1,312 @@
+#!/bin/sh
+
+# ceph-auto-snapshot for Linux
+# Automatically create, rotate, and destroy periodic CEPH snapshots for CEPHFS subvolumes
+
+opt_keep=''
+opt_label=''
+opt_prefix='ceph-auto-snap'
+opt_do_snapshots=1
+opt_sep='_'
+opt_dry_run=''
+
+# Global summary statistics.
+DESTRUCTION_COUNT='0'
+SNAPSHOT_COUNT='0'
+WARNING_COUNT='0'
+
+# Other global variables.
+SNAPSHOTS_OLD=''
+
+print_usage () {
+  echo "Usage: $0 [options] [-l label] <name [name...]>
+  -d, --debug        Print debugging messages.
+  -n, --dry-run      Print actions without actually doing anything.
+  -h, --help         Print this usage message.
+  -k, --keep=NUM     Keep NUM recent snapshots and destroy older snapshots.
+  -l, --label=LAB    LAB is usually 'hourly', 'daily', or 'monthly'.
+  -p, --prefix=PRE   PRE is 'ceph-auto-snap' by default.
+  -q, --quiet        Suppress warnings and notices at the console.
+  -g, --syslog       Write messages into the system log.
+  -v, --verbose      Print info messages.
+      --sep=CHAR     Use CHAR to separate date stamps in snapshot names.
+      --destroy-only Only destroy older snapshots, do not create new ones.
+      name           Cephfs subvolume group name."
+}
+
+# level, message, ...
+print_log () {
+  LEVEL=$1
+  shift 1
+  case $LEVEL in
+    (eme*)
+      test -n "$opt_syslog" && logger -t "$opt_prefix" -p daemon.emerge $*
+      echo Emergency: $* 1>&2
+      ;;
+    (ale*)
+      test -n "$opt_syslog" && logger -t "$opt_prefix" -p daemon.alert $*
+      echo Alert: $* 1>&2
+      ;;
+    (cri*)
+      test -n "$opt_syslog" && logger -t "$opt_prefix" -p daemon.crit $*
+      echo Critical: $* 1>&2
+      ;;
+    (err*)
+      test -n "$opt_syslog" && logger -t "$opt_prefix" -p daemon.err $*
+      echo Error: $* 1>&2
+      ;;
+    (war*)
+      test -n "$opt_syslog" && logger -t "$opt_prefix" -p daemon.warning $*
+      test -z "$opt_quiet" && echo Warning: $* 1>&2
+      ;;
+    (not*)
+      test -n "$opt_syslog" && logger -t "$opt_prefix" -p daemon.notice $*
+      test -z "$opt_quiet" && echo $*
+      ;;
+    (inf*)
+      # test -n "$opt_syslog" && logger -t "$opt_prefix" -p daemon.info $*
+      test -z "$opt_quiet" && test -n "$opt_verbose" && echo $*
+      ;;
+    (deb*)
+      # test -n "$opt_syslog" && logger -t "$opt_prefix" -p daemon.debug $*
+      test -n "$opt_debug" && echo Debug: $*
+      ;;
+    (*)
+      test -n "$opt_syslog" && logger -t "$opt_prefix" $*
+      echo $* 1>&2
+      ;;
+  esac
+}
+
+# [argv]
+do_run () {
+  if [ -n "$opt_dry_run" ]
+  then
+    echo $*
+    RC="$?"
+  else
+    eval $*
+    RC="$?"
+    if [ "$RC" -eq '0' ]
+    then
+      print_log debug "$*"
+    else
+      print_log warning "$* returned $RC"
+    fi
+  fi
+  return "$RC"
+}
+# snapname, oldglob, subvolume_group
+create_delete_snapshots_for_subvolume_group () {
+  local SNAP_NAME="$1"
+  local GLOB="$2"
+  local SUBVOLUME_GROUP="$3"
+  local KEEP=''
+
+  # global DESTRUCTION_COUNT
+  # global SNAPSHOT_COUNT
+  # global WARNING_COUNT
+  # global SNAPSHOTS_OLD
+
+  for SUBVOLUME_NAME in `ceph fs subvolume ls cephfs --group_name $SUBVOLUME_GROUP | jq -r .[].name`
+  do
+    if [ -n "$opt_do_snapshots" ]
+    then
+      if do_run "ceph fs subvolume snapshot create cephfs $SUBVOLUME_NAME $SNAP_NAME --group_name $SUBVOLUME_GROUP" 
+      then
+        SNAPSHOT_COUNT=$(( $SNAPSHOT_COUNT + 1 ))
+      else
+	WARNING_COUNT=$(( $WARNING_COUNT + 1 ))
+	continue
+      fi
+    fi
+
+    # Retain at most $opt_keep number of old snapshots of this filesystem,
+    # including the one that was just recently created.
+    test -z "$opt_keep" && continue
+    KEEP="$opt_keep"
+
+    # ASSERT: The old snapshot list is sorted by increasing age.
+    for SNAPSHOT_NAME in `ceph fs subvolume snapshot ls cephfs $SUBVOLUME_NAME --group_name $SUBVOLUME_GROUP | jq -r .[].name | sort -r`
+    do
+      # Check whether this is an old snapshot of the filesystem.
+      if [ -z "${SNAPSHOT_NAME#$GLOB}" ]
+      then
+	KEEP=$(( $KEEP - 1 ))
+	if [ "$KEEP" -le '0' ]
+	then
+ 	  if do_run "ceph fs subvolume snapshot rm cephfs $SUBVOLUME_NAME $SNAPSHOT_NAME --group_name $SUBVOLUME_GROUP "
+  	  then
+	    DESTRUCTION_COUNT=$(( $DESTRUCTION_COUNT + 1 ))
+	  else
+	    WARNING_COUNT=$(( $WARNING_COUNT + 1 ))
+	  fi
+	fi
+      fi
+    done
+  done
+}
+
+
+#main () {
+  GETOPT_BIN="getopt"
+  GETOPT=$($GETOPT_BIN \
+  --longoptions=keep:,label:,prefix:,sep: \
+  --longoptions=debug,help,quiet,syslog,verbose \
+  --longoptions=destroy-only,dry-run,sep: \
+  --options=dnshe:l:k:p:rs:qgvm: \
+  -- "$@" ) \
+  || exit 128
+  eval set -- "$GETOPT"
+
+  while [ "$#" -gt '0' ]
+  do
+    case "$1" in
+      (-d|--debug)
+        opt_debug='1'
+	opt_quiet=''
+	opt_verbose='1'
+	shift 1
+        ;;
+      (-h|--help)
+	print_usage
+	exit 0
+        ;;
+      (-k|--keep)
+        if ! test "$2" -gt '0' 2>/dev/null
+	then
+	  print_log error "The $1 parameter must be a positive integer."
+	  exit 129
+	fi
+	opt_keep="$2"
+	shift 2
+        ;;
+      (-l|--label)
+        opt_label="$2"
+	shift 2
+        ;;
+      (-p|--prefix)
+	opt_prefix="$2"
+	while test "${#opt_prefix}" -gt '0'
+	do
+  	  case $opt_prefix in
+	    ([![:alnum:]_.:\ -]*)
+	    print_log error "The $1 parameter must be alphanumeric."
+	    exit 130
+  	  esac
+	  opt_prefix="${opt_prefix#?}"
+	done
+	opt_prefix="$2"
+	shift 2
+        ;;
+      (-n|--dry-run)
+        opt_dry_run='1'
+	shift 1
+	;;
+      (--sep)
+	case "$2" in
+          ([[:alnum:]_.:\ -])
+	    :
+	  ;;
+	('')
+  	  print_log error "The $1 parameter must be non-empty."
+	  exit 131
+	  ;;
+	(*)
+	  print_log error "The $1 parameter must be one alphanumeric character."
+	  exit 132
+	  ;;
+	esac
+	opt_sep="$2"
+	shift 2
+	;;
+      (-q|--quiet)
+        opt_debug=''
+	opt_quiet='1'
+	opt_verbose=''
+	shift 1
+        ;;
+      (--sep)
+        case "$2" in
+	  ([[:alnum:]_.:\ -])
+	    :
+	    ;;
+	  ('')
+	    print_log error "The $1 parameter must be non-empty."
+	    exit 131
+	    ;;
+	  (*)
+	    print_log error "The $1 parameter must be one alphanumeric character."
+	    exit 132
+	    ;;
+	esac
+	opt_sep="$2"
+	shift 2
+	;;
+      (-g|--syslog)
+	opt_syslog='1'
+	shift 1
+        ;;
+      (-v|--verbose)
+	opt_quiet=''
+	opt_verbose='1'
+	shift 1
+        ;;
+      (--destroy-only)
+	opt_do_snapshots=''
+	shift 1
+        ;;
+      (--)
+	shift 1
+	break
+        ;;
+    esac
+  done
+
+  if [ "$#" -eq '0' ]
+  then
+    print_log error "The subvolume group argument list is empty."
+    exit 133
+  fi
+
+  group_list=$@
+
+  # ISO style date; fifteen characters: YYYY-MM-DD-HHMM
+  DATE=$(date -u +%F-%H%M)
+
+  # The snapshot name after the @ symbol.
+  SNAPNAME="${opt_prefix:+$opt_prefix$opt_sep}${opt_label:+$opt_label}-$DATE"
+
+  # The expression for matching old snapshots.  -YYYY-MM-DD-HHMM
+  SNAPGLOB="${opt_prefix:+$opt_prefix$opt_sep}${opt_label:+$opt_label}-???????????????"
+
+  if [ -n "$opt_do_snapshots" ]
+  then
+    print_log info "Doing recursive snapshots of subvolumes for groups in group list: $group_list"
+    if test -n "$opt_keep" && [ "$opt_keep" -ge "1" ]
+    then
+      print_log info "Destroying all but the newest $opt_keep snapshots of each subvolume."
+    fi
+  elif test -n "$opt_keep" && [ "$opt_keep" -ge "1" ]
+  then
+     print_log info "Recursively destroying all but the newest $opt_keep snapshots of subvolumes for groups in group list: $group_list"
+  else
+     print_log notice "Only destroying snapshots, but count of snapshots to preserve not given. Nothing to do."
+  fi
+
+  test -n "$opt_dry_run" \
+  && print_log info "Doing a dry run. Not running these commands..."
+
+
+  for subvolume_group in $group_list
+  do
+    create_delete_snapshots_for_subvolume_group $SNAPNAME $SNAPGLOB $subvolume_group; 
+  done
+
+  print_log notice "$SNAPNAME," \
+    "$SNAPSHOT_COUNT created," \
+    "$DESTRUCTION_COUNT destroyed," \
+    "$WARNING_COUNT warnings."
+
+  exit 0
+#}  
